@@ -1,12 +1,13 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 import bcrypt
 import logging
 from marshmallow import Schema, fields, ValidationError
 import openpyxl
 from datetime import datetime
-import os
 
 app = Flask(__name__)
 
@@ -24,14 +25,20 @@ CORS(app, resources={
 
 # Conectar a la base de datos
 def get_db_connection():
-    conn = sqlite3.connect('restaurant.db')
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(
+        dbname=os.getenv('DATABASE_NAME'),
+        user=os.getenv('DATABASE_USER'),
+        password=os.getenv('DATABASE_PASSWORD'),
+        host=os.getenv('DATABASE_HOST'),
+        port=os.getenv('DATABASE_PORT')
+    )
     return conn
 
 # Validar las credenciales de administrador
 def validate_admin(admin_username, admin_password):
     conn = get_db_connection()
-    admin = conn.execute('SELECT * FROM users WHERE username = ?', (admin_username,)).fetchone()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    admin = cursor.execute('SELECT * FROM users WHERE username = %s', (admin_username,)).fetchone()
     conn.close()
     if admin and bcrypt.checkpw(admin_password.encode('utf-8'), admin['password']):
         return True
@@ -80,17 +87,19 @@ def register_user():
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
     conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        conn.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hashed_password))
+        cursor.execute('INSERT INTO users (username, password) VALUES (%s, %s)', (username, hashed_password))
         conn.commit()
         response = jsonify({'message': 'Usuario registrado'}), 201
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         logging.warning(f"User {username} already exists")
         response = jsonify({'message': 'Usuario ya existe'}), 400
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         response = jsonify({'message': 'Error interno del servidor'}), 500
     finally:
+        cursor.close()
         conn.close()
 
     return add_cors_headers(response)
@@ -110,7 +119,8 @@ def login_user():
     logging.debug(f"Received login request for user: {username}")
 
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    user = cursor.execute('SELECT * FROM users WHERE username = %s', (username,)).fetchone()
     conn.close()
 
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password']):
@@ -143,19 +153,21 @@ def add_sale():
     logging.debug(f"Received add sale request for items: {items} by user: {username} at {timestamp}")
 
     conn = get_db_connection()
+    cursor = conn.cursor()
     total_price = 0.0
     try:
         for item in items:
             total_item_price = item['quantity'] * item['price']
             total_price += total_item_price
-            conn.execute('INSERT INTO sales (username, item, quantity, price, total_price, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
-                         (username, item['name'], item['quantity'], item['price'], total_item_price, timestamp))
+            cursor.execute('INSERT INTO sales (username, item, quantity, price, total_price, timestamp) VALUES (%s, %s, %s, %s, %s, %s)',
+                           (username, item['name'], item['quantity'], item['price'], total_item_price, timestamp))
         conn.commit()
         response = jsonify({'message': 'Venta registrada', 'total_price': total_price}), 201
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         response = jsonify({'message': 'Error interno del servidor'}), 500
     finally:
+        cursor.close()
         conn.close()
 
     # Guardar en Excel
@@ -174,8 +186,9 @@ def get_sales():
     logging.debug("Fetching sales data")
 
     conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        sales = conn.execute('SELECT * FROM sales ORDER BY timestamp DESC').fetchall()
+        sales = cursor.execute('SELECT * FROM sales ORDER BY timestamp DESC').fetchall()
         daily_sales = []
         daily_total = 0.0
         current_date = None
@@ -213,6 +226,7 @@ def get_sales():
         logging.error(f"An error occurred: {e}")
         response = jsonify({'message': 'Error interno del servidor'}), 500
     finally:
+        cursor.close()
         conn.close()
 
     return add_cors_headers(response)
@@ -230,13 +244,15 @@ def search_menu():
     logging.debug(f"Received search request for query: {query}")
 
     conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        results = conn.execute('SELECT * FROM menu WHERE name LIKE ?', (f'%{query}%',)).fetchall()
+        results = cursor.execute('SELECT * FROM menu WHERE name LIKE %s', (f'%{query}%',)).fetchall()
         response = jsonify([dict(row) for row in results]), 200
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         response = jsonify({'message': 'Error interno del servidor'}), 500
     finally:
+        cursor.close()
         conn.close()
 
     return add_cors_headers(response)
@@ -261,20 +277,37 @@ def add_item():
     logging.debug(f"Received add item request for item: {name} with price: {price}")
 
     conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        conn.execute('INSERT INTO menu (name, price) VALUES (?, ?)', (name, price))
+        cursor.execute('INSERT INTO menu (name, price) VALUES (%s, %s)', (name, price))
         conn.commit()
         response = jsonify({'message': 'Item added successfully'}), 201
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         logging.warning(f"Item {name} already exists")
         response = jsonify({'message': 'Item already exists'}), 400
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         response = jsonify({'message': 'Error interno del servidor'}), 500
     finally:
+        cursor.close()
         conn.close()
 
     return add_cors_headers(response)
+
+# Ruta para ver las ventas en una página HTML
+@app.route('/view_sales', methods=['GET'])
+def view_sales():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        sales = cursor.execute('SELECT * FROM sales ORDER BY timestamp DESC').fetchall()
+        return render_template('sales.html', sales=sales)
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return "Error interno del servidor", 500
+    finally:
+        cursor.close()
+        conn.close()
 
 # Función para guardar las ventas en un archivo Excel
 def save_to_excel(items, username, timestamp):
